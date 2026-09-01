@@ -1,0 +1,87 @@
+# Release build for the Upwind Terraform provider.
+#
+# Run by the release workflow on a `v*` tag; nothing here is used by a normal
+# build. The Terraform Registry ingests the GitHub release this produces, so the
+# artifact names and the signed checksum file are a contract with the Registry
+# rather than free choices - see
+# https://developer.hashicorp.com/terraform/registry/providers/publishing
+#
+# Signing needs GPG_FINGERPRINT in the environment and the matching secret key
+# already imported into the runner's keyring. Both are supplied by the release
+# environment; no key material or path belongs in this file.
+version: 2
+
+project_name: terraform-provider-upwind
+
+before:
+  hooks:
+    # download, not tidy: a release must build the dependency set that was
+    # reviewed, and tidy rewrites go.mod/go.sum during the build. CI already
+    # fails a PR whose module files are untidy.
+    - go mod download
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    # Terraform looks for `terraform-provider-<name>_v<version>` inside the zip
+    # and will not load a binary named anything else.
+    binary: '{{ .ProjectName }}_v{{ .Version }}'
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    flags:
+      - -trimpath
+    ldflags:
+      # main.version is what the provider reports to the Registry and puts in its
+      # User-Agent; without this it stays "dev" in a released build.
+      - '-s -w -X main.version={{ .Version }}'
+    goos:
+      - freebsd
+      - windows
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - '386'
+      - arm
+      - arm64
+    ignore:
+      # 32-bit macOS has not existed since 10.15.
+      - goos: darwin
+        goarch: '386'
+
+archives:
+  # zip for every platform, including Linux: the Registry expects one format.
+  - formats: [zip]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+
+checksum:
+  name_template: '{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
+  algorithm: sha256
+  # The manifest is checksummed alongside the archives because the Registry
+  # verifies it against SHA256SUMS like any other release artifact.
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
+
+signs:
+  # Produces the detached `..._SHA256SUMS.sig` the Registry requires. It verifies
+  # that signature against the public GPG key on the Registry account, so the key
+  # used here must be the one uploaded there.
+  - artifacts: checksum
+    args:
+      - '--batch'
+      - '--local-user'
+      - '{{ .Env.GPG_FINGERPRINT }}'
+      - '--output'
+      - '${signature}'
+      - '--detach-sign'
+      - '${artifact}'
+
+release:
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
+
+changelog:
+  # Release notes come from CHANGELOG.md, passed in with --release-notes by the
+  # release workflow, not derived from commit subjects.
+  disable: true

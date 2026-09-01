@@ -1,0 +1,81 @@
+# Publishes a release to the Terraform Registry. Triggered by pushing a v* tag,
+# never on a branch: a release is a deliberate act, and the tag names the version.
+#
+# It pairs with .goreleaser.yml and reads CHANGELOG.md for the release notes. The
+# Registry ingests the GitHub Release and its GPG-signed checksums, so this repo
+# needs the GPG_PRIVATE_KEY and PASSPHRASE secrets, and the matching public key
+# must be uploaded to the Registry publisher account.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  # GoReleaser creates the GitHub Release and uploads the artifacts.
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # GoReleaser derives the version from the tag and needs the full
+          # history to do it; a shallow clone makes it report "dirty".
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      # Pinned to a commit sha, not a tag. This step receives GPG_PRIVATE_KEY and
+      # its passphrase, and the signature it produces is what the Registry uses
+      # to attest a downloaded binary is genuinely Upwind's. A tag is a movable
+      # ref: if v6 were repointed, the next release would sign with a key an
+      # attacker had seen. Dependabot updates sha pins as it does tags.
+      - name: Import the GPG signing key
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec # v6.3.0
+        id: import_gpg
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      # The tag name is bound through env, never interpolated into the script:
+      # ${{ }} expands into the script text before bash parses it, so an
+      # interpolated tag would be code rather than data.
+      #
+      # Written to RUNNER_TEMP, not the workspace: `goreleaser release` refuses a
+      # dirty git tree, and a new file in the repo is a dirty tree.
+      - name: Take the release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          awk -v hdr="## [$version]" '
+            index($0, hdr) == 1 { inside = 1; next }
+            inside && index($0, "## [") == 1 { exit }
+            inside { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          if [ ! -s "$RUNNER_TEMP/release-notes.md" ]; then
+            echo "::error::CHANGELOG.md has no section for $version - the release would ship with empty notes"
+            exit 1
+          fi
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          # Pinned exactly: the build tool decides what the artifacts are, and
+          # a floating range makes the release date pick the version. Bump by
+          # hand - Dependabot updates the action pin above, not this input.
+          version: 'v2.18.0'
+          args: release --clean --release-notes=${{ runner.temp }}/release-notes.md
+        env:
+          # .goreleaser.yml signs the checksum file with this fingerprint. The
+          # key it names must be the one uploaded to the Registry account, or
+          # the Registry rejects the release as unverifiable.
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
