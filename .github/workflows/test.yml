@@ -1,0 +1,90 @@
+# Pre-merge checks. Unit tests only: the acceptance tests (TF_ACC=1) create real
+# objects in a live tenant, so they stay a `make testacc` run against a scratch org.
+#
+# Actions are pinned to a commit sha, not a tag - a tag can be repointed at code
+# that would then run in a job holding this repository's token.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# main is exempt: every commit there should keep a recorded result.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Check formatting
+        # gofmt exits 0 whether or not it found anything, so test the output, not the status.
+        run: |
+          set -euo pipefail
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "::error::these files are not gofmt -s clean:"
+            gofmt -s -l .
+            exit 1
+          fi
+
+      - name: Verify go.mod and go.sum are tidy
+        # A stale go.sum builds on one machine and not another.
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum \
+            || { echo "::error::go.mod/go.sum are not tidy - run 'go mod tidy'"; exit 1; }
+
+      - run: go vet ./...
+
+      - name: Test
+        # -race: Terraform calls the resource and data-source RPCs concurrently.
+        # -count=1: a cached pass would mean "unchanged", not "passing".
+        run: go test -race -count=1 -timeout 5m ./...
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: false # the action manages its own cache
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Pinned so a new default linter cannot redden an unrelated PR.
+          version: v2.13.2
+
+  docs:
+    name: docs are up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      # The Registry serves the committed pages, not the generator, so an edited
+      # MarkdownDescription without a regenerated page ships wrong docs silently.
+      - name: Regenerate and diff
+        run: |
+          set -euo pipefail
+          go install github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@v0.25.0
+          make docs
+          git diff --exit-code -- docs/ \
+            || { echo "::error::docs/ is stale - run 'make docs' and commit the result"; exit 1; }
