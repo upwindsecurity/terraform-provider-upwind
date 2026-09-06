@@ -1,0 +1,1 @@
+terraform import upwind_access_scope.production_aws uams-xxxxxxxxxxxxxxxx

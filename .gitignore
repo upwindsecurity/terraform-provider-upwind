@@ -1,0 +1,36 @@
+# Compiled provider binary
+terraform-provider-upwind
+*.exe
+*.dll
+*.so
+*.dylib
+
+# GoReleaser output
+dist/
+
+# Go test / build artifacts
+*.test
+*.out
+coverage.txt
+vendor/
+
+# Terraform working files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Local Terraform CLI config (dev overrides may contain local paths)
+.terraformrc
+terraform.rc
+
+# Internal design notes, kept out of the tree.
+specs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

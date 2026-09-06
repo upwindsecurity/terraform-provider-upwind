@@ -1,0 +1,21 @@
+# Routine version bumps. Dependabot security updates are already on for this
+# repository and cover a different set.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # The terraform-plugin-* modules expect compatible versions; one PR each
+      # gives a run of red builds until the last one lands.
+      terraform-plugin:
+        patterns:
+          - 'github.com/hashicorp/terraform-plugin-*'
+
+  # Dependabot rewrites a sha pin and its `# vX.Y.Z` comment together, so
+  # pinning by sha costs no update coverage.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

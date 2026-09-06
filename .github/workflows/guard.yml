@@ -1,0 +1,75 @@
+# Fails a pull request that would commit an infrastructure identifier, a
+# credential, or private key material. Publication is irreversible: removing the
+# commit does not un-publish what was already cloned, forked or indexed, so this
+# runs before merge rather than at release time.
+#
+# The patterns are generic by design. A check that spelled out an identifier in
+# order to search for it would publish that identifier here, so account ids are
+# matched by shape and cleared against an allowlist of placeholders.
+name: guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: no internal identifiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # --exclude=guard.yml throughout: this file names what it searches for, so
+      # without the exclusion every run matches itself. It is therefore the one
+      # file the check cannot cover, which is why nothing sensitive belongs in it.
+      - name: Grep for identifiers that must never be public
+        run: |
+          set -uo pipefail
+          fail=0
+
+          # Cloud account ids are 12 digits. The placeholders used across the
+          # docs, examples and acceptance tests are allowlisted; extend the
+          # allowlist rather than loosening the pattern.
+          if grep -rIEno --exclude-dir=.git --exclude=guard.yml '\b[0-9]{12}\b' . \
+               | grep -vE ':(123456789012|210987654321|111111111111|000000000000)$' ; then
+            echo "::error::the lines above contain a 12-digit account id that is not a known placeholder"
+            fail=1
+          fi
+
+          # An AWS access key id, which no fixture has a reason to contain.
+          if grep -rIEn --exclude-dir=.git --exclude=guard.yml 'AKIA[0-9A-Z]{16}' . ; then
+            echo "::error::tree contains what looks like an AWS access key id"
+            fail=1
+          fi
+
+          # Infrastructure names and private key material.
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            if grep -rIn --exclude-dir=.git --exclude=guard.yml -e "$pattern" . ; then
+              echo "::error::tree contains a forbidden pattern: $pattern"
+              fail=1
+            fi
+          done <<'PATTERNS'
+          svc.cluster.local
+          keycloak
+          BEGIN RSA PRIVATE KEY
+          BEGIN OPENSSH PRIVATE KEY
+          BEGIN PGP PRIVATE KEY
+          PATTERNS
+
+          # Paths that are not part of this repository. A reference sends a
+          # reader after something that does not exist here, so a mention fails
+          # as well. .gitignore is excepted; it needs the pattern to do its job.
+          for internal in 'cmd/api-get' 'specs/'; do
+            if grep -rIn --exclude-dir=.git --exclude=guard.yml --exclude=.gitignore -e "$internal" . ; then
+              echo "::error::tree references a path that is not part of this repository: $internal"
+              fail=1
+            fi
+          done
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "guard passed"
