@@ -184,6 +184,97 @@ func TestAccPolicyRuleResource(t *testing.T) {
 	})
 }
 
+// TestAccPolicyRuleResource_DisabledParent covers the case TestAccPolicyRuleResource
+// structurally cannot: its fixture omits is_enabled on the policy, so the parent is
+// always enabled and an inherited-disabled rule never occurs.
+//
+// The API reports is_enabled as an EFFECTIVE value capped by the policy's, so a rule
+// inside a disabled policy reads back false however it was written. With a static
+// schema default this planned true and apply contradicted its own plan - "Provider
+// produced inconsistent result after apply" - for every rule attached to a disabled
+// policy. Staging a policy disabled, attaching rules, then enabling it is a normal
+// workflow for a security control, which is why this is not an edge case.
+func TestAccPolicyRuleResource_DisabledParent(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: testAccCheckDestroyed(t, "upwind_threat_policy_rule",
+			func(c *client.Client, rs *terraform.ResourceState) error {
+				_, err := c.GetPolicyRule(context.Background(), rs.Primary.Attributes["policy_id"], rs.Primary.ID)
+				return err
+			}),
+		Steps: []resource.TestStep{
+			// Step 1: attach to a DISABLED policy. The rule must come back disabled.
+			// Before the fix this step failed the apply outright rather than failing
+			// an assertion, which is what made the bug invisible to a suite that
+			// never built this shape.
+			{
+				Config: testAccPolicyRuleDisabledParentConfig(false),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("upwind_threat_policy.parent", "is_enabled", "false"),
+					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "false"),
+				),
+			},
+			// Step 2: enable the policy. The rule's effective state follows it, and
+			// the config still says nothing about is_enabled - so this also proves
+			// the inherited value is not recorded as an owned one that drifts.
+			{
+				Config: testAccPolicyRuleDisabledParentConfig(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("upwind_threat_policy.parent", "is_enabled", "true"),
+					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "true"),
+				),
+			},
+		},
+	})
+}
+
+// testAccPolicyRuleDisabledParentConfig renders a rule attached to a policy whose
+// enabled state is the variable under test. is_enabled is deliberately absent from
+// the rule block: the point is what the provider does with a value it must let the
+// server decide.
+func testAccPolicyRuleDisabledParentConfig(policyEnabled bool) string {
+	return fmt.Sprintf(`
+provider "upwind" {}
+
+resource "upwind_threat_policy" "parent" {
+  name        = "tf-acc-test-policy-disabled-parent"
+  severity    = "low"
+  source_type = "cloud_logs"
+  is_enabled  = %[1]t
+
+  metadata = {
+    detection_title       = "TF Acc Disabled Parent"
+    detection_description = "created by acceptance test"
+  }
+}
+
+resource "upwind_threat_rule_definition" "parent_rd" {
+  name            = "tf-acc-test-rd-disabled-parent"
+  engine          = "rego"
+  threat_category = "cloud_trail_logs"
+
+  rule_expression = <<-REGO
+    package policy.custom.cloud_trail_logs
+
+    is_violated(input_item) if {
+        input_item.eventName == "TerraformDisabledParentTestEventThatNeverHappens"
+    }
+  REGO
+
+  metadata = {
+    detection_title       = "TF Acc Disabled Parent Rule"
+    detection_description = "created by acceptance test"
+  }
+}
+
+resource "upwind_threat_policy_rule" "test" {
+  policy_id          = upwind_threat_policy.parent.id
+  rule_definition_id = upwind_threat_rule_definition.parent_rd.id
+}
+`, policyEnabled)
+}
+
 func TestAccMalwareIndicatorResource(t *testing.T) {
 	// A syntactically valid sha1 that no real file will match.
 	const hash = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
