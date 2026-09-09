@@ -50,6 +50,27 @@ Provider configuration is per-organization, so managing more than one means one
 aliased provider block per organization and a `provider` argument on each
 resource.
 
+## Inherited and effective values
+
+A `upwind_threat_policy_rule` lives inside a `upwind_threat_policy`, and for the
+nested object the Management API reports **effective** values - what applies
+after inheritance - not what was written. Three fields behave this way:
+
+| Field on the rule | Inherits from the policy when | Read back as                  |
+| ----------------- | ----------------------------- | ----------------------------- |
+| `severity`        | the rule sets no override     | the policy's `severity`       |
+| `scope`           | the rule sets no override     | the policy's `resource_scope` |
+| `is_enabled`      | the policy is disabled        | `false`                       |
+
+For `severity` and `scope` the provider records only what the rule itself owns,
+so an inherited value stays null in state and does not appear as drift on the
+next plan. The read-only `scope_type` attribute names which side the effective
+scope came from.
+
+`is_enabled` is a ceiling rather than an override: a rule inside a policy with
+`is_enabled = false` reads back as disabled whatever the rule asks for. To
+enable a rule, enable its policy.
+
 ## Troubleshooting
 
 Every API call the provider makes is logged. Set `TF_LOG=DEBUG` (or

@@ -50,7 +50,7 @@ resource "upwind_threat_policy_rule" "sandbox_waf" {
 
 ### Optional
 
-- `is_enabled` (Boolean) Whether this rule is enabled within the policy. Defaults to `true`.
+- `is_enabled` (Boolean) Whether this rule is enabled within the policy. The platform reports the effective state, so a rule inside a policy with `is_enabled = false` reads back as `false` whatever is set here - enable the policy to enable its rules. Omit to inherit.
 - `scope` (Attributes) Resource scope override for this rule. Omit to inherit the policy's scope. (see [below for nested schema](#nestedatt--scope))
 - `severity` (String) Severity override for this rule. One of `low`, `medium`, `high`, `critical`. Omit to inherit the policy's severity. Removing it replaces the rule, because the API has no way to clear an override in place.
 

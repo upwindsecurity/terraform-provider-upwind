@@ -10,7 +10,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -106,11 +105,26 @@ func (r *PolicyRuleResource) Schema(ctx context.Context, req resource.SchemaRequ
 					),
 				},
 			},
+			// DRIFT DEFENSE: the API returns the EFFECTIVE enabled state, which is
+			// capped by the policy's - a rule inside a disabled policy reads back
+			// false however it was written.
+			//
+			// So no Default. A static default is a plan-time promise the framework
+			// then enforces against the apply result, and attaching a rule to a
+			// disabled policy broke that promise: planned true, read back false,
+			// "Provider produced inconsistent result after apply". Worse, the default
+			// re-asserts itself on every later plan (TransformDefaults consults the
+			// config, never prior state), so the resource could never converge.
+			//
+			// Optional+Computed with no default leaves it unknown during a create,
+			// which absorbs whatever the server reports. An explicit is_enabled = true
+			// under a disabled policy still errors, correctly: that state cannot exist.
 			"is_enabled": schema.BoolAttribute{
-				Optional:            true,
-				Computed:            true,
-				Default:             booldefault.StaticBool(true),
-				MarkdownDescription: "Whether this rule is enabled within the policy. Defaults to `true`.",
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "Whether this rule is enabled within the policy. The platform reports " +
+					"the effective state, so a rule inside a policy with `is_enabled = false` reads back as " +
+					"`false` whatever is set here - enable the policy to enable its rules. Omit to inherit.",
 			},
 			"scope": schema.SingleNestedAttribute{
 				Optional:            true,

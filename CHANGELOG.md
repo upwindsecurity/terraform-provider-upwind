@@ -5,6 +5,28 @@ format. The provider follows [Semantic Versioning](https://semver.org/spec/v2.0.
 Before 1.0, a minor version may carry a breaking change; breaking changes always
 appear under their own **Breaking** heading.
 
+## [0.1.1] - 2026-09-08
+
+### Fixed
+
+- `upwind_threat_policy_rule` could not be attached to a policy with
+  `is_enabled = false`. The platform reports a rule's enabled state as an
+  effective value capped by its policy's, so the rule read back as disabled
+  while the schema's static default had promised `true`, and every apply failed
+  with "Provider produced inconsistent result after apply". The attribute is now
+  computed when omitted, so it takes whatever the platform reports. Staging a
+  policy disabled and attaching rules before enabling it works as expected.
+
+  Setting `is_enabled = true` explicitly on a rule whose policy is disabled
+  still errors, which is correct - that state cannot exist.
+
+### Changed
+
+- `is_enabled` on `upwind_threat_policy_rule` no longer documents a default of
+  `true`. An omitted value is inherited, not defaulted. Configurations that set
+  the attribute explicitly are unaffected, and an omitted one keeps its value in
+  state, so no plan changes for existing users.
+
 ## [0.1.0] - 2026-09-06
 
 First release.
