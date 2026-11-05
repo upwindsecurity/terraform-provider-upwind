@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/upwindsecurity/terraform-provider-upwind/internal/client"
@@ -22,6 +23,9 @@ var (
 	_ resource.Resource                = &PolicyRuleResource{}
 	_ resource.ResourceWithConfigure   = &PolicyRuleResource{}
 	_ resource.ResourceWithImportState = &PolicyRuleResource{}
+	// The framework finds ModifyPlan by type assertion, so a drifted signature would
+	// simply stop the reset and re-assert from running, silently.
+	_ resource.ResourceWithModifyPlan = &PolicyRuleResource{}
 )
 
 // NewPolicyRuleResource is the factory registered with the provider.
@@ -118,13 +122,20 @@ func (r *PolicyRuleResource) Schema(ctx context.Context, req resource.SchemaRequ
 			//
 			// Optional+Computed with no default leaves it unknown during a create,
 			// which absorbs whatever the server reports. An explicit is_enabled = true
-			// under a disabled policy still errors, correctly: that state cannot exist.
+			// under a disabled policy still fails the apply - not because the API
+			// rejects the write (it accepts it) but because the capped read disagrees
+			// with what the config promised.
 			"is_enabled": schema.BoolAttribute{
 				Optional: true,
 				Computed: true,
+				// One paragraph, as severity is. A blank line here breaks the Registry's
+				// Optional bullet list in two and detaches the text from this attribute.
 				MarkdownDescription: "Whether this rule is enabled within the policy. The platform reports " +
 					"the effective state, so a rule inside a policy with `is_enabled = false` reads back as " +
-					"`false` whatever is set here - enable the policy to enable its rules. Omit to inherit.",
+					"`false` whatever is set here - enable the policy to enable its rules. Omit to follow the " +
+					"policy; removing it after setting it resets the rule to the API default of `true` " +
+					"(enabled) in place, with no replacement. Importing a rule whose configuration sets " +
+					"this attribute plans one update, which re-asserts the configured value.",
 			},
 			"scope": schema.SingleNestedAttribute{
 				Optional:            true,
@@ -220,6 +231,115 @@ func severityRemovalRequiresReplace(_ context.Context, req planmodifier.StringRe
 	resp.RequiresReplace = !req.StateValue.IsNull() && req.ConfigValue.IsNull()
 }
 
+// isEnabledOwnedKey records, in private state, whether the practitioner set
+// is_enabled. State cannot answer that: is_enabled is Optional+Computed, so it always
+// holds the effective value and a never-set attribute is indistinguishable from a
+// removed one.
+const isEnabledOwnedKey = "is_enabled_owned"
+
+// isEnabledWasRemoved reports a removal: the practitioner had is_enabled in the
+// config, this rule owns the value on the server, and the line is now gone.
+//
+// State cannot answer this on its own. is_enabled is Optional+Computed, so it always
+// holds the effective value and a never-set attribute looks exactly like a removed
+// one; the API offers no discriminator either (a GET returns no default_values for
+// it). Hence the private-state record.
+func isEnabledWasRemoved(hasState, hasPlan, configSet, owned bool) bool {
+	return hasState && hasPlan && !configSet && owned
+}
+
+// isEnabledWasNeverAsserted reports a value the config states but the API was never
+// told: the practitioner wrote is_enabled, and no write of ours has claimed it.
+//
+// The read cannot reveal this. Under a disabled policy every rule reports false
+// whatever it holds, so is_enabled = false matches state exactly, nothing is planned
+// and the rule keeps the API default of true - until the policy is enabled and a
+// detection the practitioner declared off goes live.
+//
+// Rules with no private data at all land here too, which is deliberate: one apply
+// after upgrading re-asserts a configured is_enabled that an older version may never
+// have sent.
+func isEnabledWasNeverAsserted(hasState, hasPlan, configSet, owned bool) bool {
+	return hasState && hasPlan && configSet && !owned
+}
+
+// ModifyPlan turns a removed is_enabled into a diff, so Update runs and can reset the
+// rule to the API default.
+//
+// Resource level rather than an attribute plan modifier, and that is not a style
+// choice. The framework marks write-derived Computed attributes unknown only when the
+// PROPOSED plan already differs from prior state, and that pass runs BEFORE attribute
+// modifiers. A removal is invisible at that point - for an Optional+Computed
+// attribute a null config means "keep prior state" - so a modifier that creates the
+// diff afterwards leaves update_time and last_modifier_id pinned to their stale
+// values and the apply dies with "inconsistent result after apply".
+//
+// Rules written before isEnabledOwnedKey existed carry no private data and are left
+// alone, so upgrading changes no plans; one holding an unwanted false picks the reset
+// up as soon as its configuration changes for any other reason.
+func (r *PolicyRuleResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	owned := isEnabledOwnedRecord(ctx, req.Private, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	var configIsEnabled types.Bool
+	if !req.Config.Raw.IsNull() {
+		resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("is_enabled"), &configIsEnabled)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	hasState, hasPlan := !req.State.Raw.IsNull(), !req.Plan.Raw.IsNull()
+	configSet := !configIsEnabled.IsNull()
+
+	switch {
+	case isEnabledWasRemoved(hasState, hasPlan, configSet, owned):
+		// Unknown, not a literal true: the reset restores the API default, which the
+		// policy caps on read, so planning true under a disabled policy would
+		// contradict the apply.
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("is_enabled"), types.BoolUnknown())...)
+	case isEnabledWasNeverAsserted(hasState, hasPlan, configSet, owned):
+		// is_enabled is deliberately left alone here. Terraform rejects a planned
+		// value that differs from a known config value, so the diff has to be carried
+		// by the write-derived attributes below instead - which is enough, because any
+		// non-empty plan calls ApplyResourceChange and Update then sends the value.
+	default:
+		return
+	}
+
+	// Both paths write, and these two move on every write - the same two the schema
+	// denies UseStateForUnknown for. Marking them is what makes the plan non-empty in
+	// the assert case; in the reset case it keeps apply from contradicting its plan.
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("update_time"), types.StringUnknown())...)
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("last_modifier_id"), types.StringUnknown())...)
+}
+
+// isEnabledOwnedRecord reads the ownership flag back. Absent data - a rule written
+// before this key existed, or imported - reads as NOT owned, so nothing is reset
+// behind the practitioner's back. A nil *privatestate.ProviderData is safe: GetKey
+// handles a nil receiver and returns no data.
+func isEnabledOwnedRecord(ctx context.Context, private interface {
+	GetKey(context.Context, string) ([]byte, diag.Diagnostics)
+}, diags *diag.Diagnostics) bool {
+	v, d := private.GetKey(ctx, isEnabledOwnedKey)
+	diags.Append(d...)
+	return string(v) == "true"
+}
+
+// recordIsEnabledOwned stores whether this write set is_enabled, for the plan
+// modifier above. Values must be valid JSON.
+func recordIsEnabledOwned(ctx context.Context, private interface {
+	SetKey(context.Context, string, []byte) diag.Diagnostics
+}, owned bool) diag.Diagnostics {
+	v := []byte("false")
+	if owned {
+		v = []byte("true")
+	}
+	return private.SetKey(ctx, isEnabledOwnedKey, v)
+}
+
 func (r *PolicyRuleResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
@@ -235,6 +355,25 @@ func (r *PolicyRuleResource) Configure(ctx context.Context, req resource.Configu
 	r.client = c
 }
 
+// isEnabledFromConfig returns the practitioner's is_enabled, or nil when they did
+// not write one.
+//
+// It reads the CONFIG on purpose. is_enabled is Optional+Computed, so the plan holds
+// unknown on a create and the prior state on an update - neither of which answers
+// "did the practitioner set this?". Sending a value derived from the plan is what made
+// an omitted attribute become an owned `false` the platform then refused to change.
+//
+// nil means "send nothing", which is what lets the rule inherit its policy's state.
+func isEnabledFromConfig(ctx context.Context, config tfsdk.Config, diags *diag.Diagnostics) *bool {
+	var isEnabled types.Bool
+	diags.Append(config.GetAttribute(ctx, path.Root("is_enabled"), &isEnabled)...)
+	if diags.HasError() || isEnabled.IsNull() || isEnabled.IsUnknown() {
+		return nil
+	}
+	v := isEnabled.ValueBool()
+	return &v
+}
+
 func (r *PolicyRuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan policyRuleResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -248,10 +387,8 @@ func (r *PolicyRuleResource) Create(ctx context.Context, req resource.CreateRequ
 		return
 	}
 
-	isEnabled := plan.IsEnabled.ValueBool()
 	createReq := client.CreatePolicyRuleRequest{
 		RuleDefinitionID: plan.RuleDefinitionID.ValueString(),
-		IsEnabled:        &isEnabled,
 		Scope:            scope,
 	}
 	// Only send severity when the practitioner set one: omitting it is what makes
@@ -260,6 +397,14 @@ func (r *PolicyRuleResource) Create(ctx context.Context, req resource.CreateRequ
 		sev := plan.Severity.ValueString()
 		createReq.Severity = &sev
 	}
+	// CONFIG, not plan. is_enabled is Optional+Computed, so the plan holds unknown
+	// here and ValueBool() renders that as false - which made every omitted value an
+	// owned `false` the policy could never override.
+	enabled := isEnabledFromConfig(ctx, req.Config, &resp.Diagnostics)
+	if enabled != nil {
+		createReq.IsEnabled = enabled
+	}
+	resp.Diagnostics.Append(recordIsEnabledOwned(ctx, resp.Private, enabled != nil)...)
 
 	pr, err := r.client.CreatePolicyRule(ctx, plan.PolicyID.ValueString(), createReq)
 	if err != nil {
@@ -276,13 +421,14 @@ func (r *PolicyRuleResource) Create(ctx context.Context, req resource.CreateRequ
 	// So the write response is not trusted as state. One GET makes the write path
 	// produce exactly what the read path would, which is the property the whole
 	// resource depends on.
-	pr, err = r.client.GetPolicyRule(ctx, plan.PolicyID.ValueString(), pr.PolicyRuleID)
+	pr, err = r.client.GetPolicyRuleAfterWrite(ctx, plan.PolicyID.ValueString(), pr.PolicyRuleID)
 	if err != nil {
 		resp.Diagnostics.AddError("Error reading policy rule back after write", err.Error())
 		return
 	}
 
-	state, diags := policyRuleToModel(ctx, pr, plan.PolicyID, plan.Severity)
+	// Null: the planned is_enabled is unknown on a create, so take the server's.
+	state, diags := policyRuleToModel(ctx, pr, plan.PolicyID, plan.Severity, types.BoolNull())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -309,7 +455,8 @@ func (r *PolicyRuleResource) Read(ctx context.Context, req resource.ReadRequest,
 		return
 	}
 
-	newState, diags := policyRuleToModel(ctx, pr, state.PolicyID, state.Severity)
+	// Null: a refresh is where the server's effective is_enabled should land.
+	newState, diags := policyRuleToModel(ctx, pr, state.PolicyID, state.Severity, types.BoolNull())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -330,10 +477,8 @@ func (r *PolicyRuleResource) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 
-	isEnabled := plan.IsEnabled.ValueBool()
 	updateReq := client.UpdatePolicyRuleRequest{
-		ID:        plan.ID.ValueString(),
-		IsEnabled: &isEnabled,
+		ID: plan.ID.ValueString(),
 		// A removed scope block must clear the override rather than be omitted,
 		// which the API would read as "leave it alone". Same reasoning as the
 		// threat policy resource.
@@ -346,6 +491,37 @@ func (r *PolicyRuleResource) Update(ctx context.Context, req resource.UpdateRequ
 		sev := plan.Severity.ValueString()
 		updateReq.Severity = &sev
 	}
+	// Config, not plan - see Create. Here the plan holds the PRIOR STATE, so sending
+	// it re-asserts a value the practitioner never wrote.
+	//
+	// A REMOVAL sends the API default rather than nothing, because the edit endpoint
+	// leaves an omitted field alone and the rule would keep the value it owns.
+	// Verified against the live API - a rule PATCHed back to true is indistinguishable
+	// from one created without the field, through a policy disable/enable cycle.
+	//
+	// The ownership record is the discriminator, and only it will do. An omitted
+	// is_enabled does NOT mean "reset": a rule can legitimately own false while the
+	// config says nothing - every rule written by v0.1.1 does, and so does one an
+	// operator disabled in the console. Resetting on every such update would enable a
+	// detection during an unrelated severity edit, with nothing in the plan to say so.
+	//
+	// The PLAN cannot answer this. Terraform marks every Computed attribute with a
+	// null config value unknown as soon as anything else in the resource changes, so
+	// plan.IsEnabled is unknown on a plain severity edit just as it is on a removal.
+	// Only private state knows whether this provider ever wrote the value.
+	owned := isEnabledOwnedRecord(ctx, req.Private, &resp.Diagnostics)
+	enabled := isEnabledFromConfig(ctx, req.Config, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	switch {
+	case enabled != nil:
+		updateReq.IsEnabled = enabled
+	case owned:
+		reset := true
+		updateReq.IsEnabled = &reset
+	}
+	resp.Diagnostics.Append(recordIsEnabledOwned(ctx, resp.Private, enabled != nil)...)
 
 	pr, err := r.client.UpdatePolicyRule(ctx, plan.PolicyID.ValueString(), updateReq)
 	if err != nil {
@@ -362,13 +538,19 @@ func (r *PolicyRuleResource) Update(ctx context.Context, req resource.UpdateRequ
 	// So the write response is not trusted as state. One GET makes the write path
 	// produce exactly what the read path would, which is the property the whole
 	// resource depends on.
-	pr, err = r.client.GetPolicyRule(ctx, plan.PolicyID.ValueString(), pr.PolicyRuleID)
+	pr, err = r.client.GetPolicyRuleAfterWrite(ctx, plan.PolicyID.ValueString(), pr.PolicyRuleID)
 	if err != nil {
 		resp.Diagnostics.AddError("Error reading policy rule back after write", err.Error())
 		return
 	}
 
-	newState, diags := policyRuleToModel(ctx, pr, plan.PolicyID, plan.Severity)
+	// Omitted is_enabled: the plan holds the prior state and the read-back may hold a
+	// newly-effective value. Keep the plan, or Terraform fails the apply.
+	plannedIsEnabled := types.BoolNull()
+	if enabled == nil {
+		plannedIsEnabled = plan.IsEnabled
+	}
+	newState, diags := policyRuleToModel(ctx, pr, plan.PolicyID, plan.Severity, plannedIsEnabled)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -412,7 +594,15 @@ func (r *PolicyRuleResource) ImportState(ctx context.Context, req resource.Impor
 // priorSeverity carries what the practitioner configured, because the API's
 // severity field is the EFFECTIVE value: a rule with no override reads back the
 // policy's severity, which would look like drift against an empty config.
-func policyRuleToModel(ctx context.Context, pr *client.PolicyRule, policyID, priorSeverity types.String) (policyRuleResourceModel, diag.Diagnostics) {
+//
+// plannedIsEnabled is the same idea, set ONLY when the practitioner omitted the
+// attribute on an update: a read-back in an apply that also enabled the parent
+// returns the new value while the plan promised the old one, which Terraform rejects
+// as "inconsistent result after apply".
+//
+// Null means take the server's value - right on a create, and right when the
+// practitioner DID set it, where a disagreement must still error.
+func policyRuleToModel(ctx context.Context, pr *client.PolicyRule, policyID, priorSeverity types.String, plannedIsEnabled types.Bool) (policyRuleResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
 	model := policyRuleResourceModel{
@@ -433,6 +623,11 @@ func policyRuleToModel(ctx context.Context, pr *client.PolicyRule, policyID, pri
 	// given (import sets it before the first read).
 	if pr.PolicyID != "" {
 		model.PolicyID = types.StringValue(pr.PolicyID)
+	}
+
+	// See the doc comment: only an omitted-on-update is_enabled is pinned.
+	if !plannedIsEnabled.IsNull() && !plannedIsEnabled.IsUnknown() {
+		model.IsEnabled = plannedIsEnabled
 	}
 
 	// DRIFT DEFENSE: severity is effective, not owned. Keep it null unless the

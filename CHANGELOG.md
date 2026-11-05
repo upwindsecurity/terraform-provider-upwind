@@ -5,6 +5,20 @@ format. The provider follows [Semantic Versioning](https://semver.org/spec/v2.0.
 Before 1.0, a minor version may carry a breaking change; breaking changes always
 appear under their own **Breaking** heading.
 
+## [0.1.2] - 2026-11-05
+
+### Fixed
+
+- `upwind_threat_policy_rule.is_enabled` now behaves as documented in every
+  direction. Omitting it follows the policy. Setting it always reaches the API,
+  including when the platform already reports the same value. Removing it restores
+  the API default in place, so the rule keeps its id and stays attached. An omitted
+  value is left alone by edits to other attributes.
+
+- `upwind_threat_policy` no longer risks failing an apply with "inconsistent result
+  after apply" on update. Only the server-populated audit fields are taken from the
+  post-write read.
+
 ## [0.1.1] - 2026-09-08
 
 ### Fixed
@@ -18,7 +32,8 @@ appear under their own **Breaking** heading.
   policy disabled and attaching rules before enabling it works as expected.
 
   Setting `is_enabled = true` explicitly on a rule whose policy is disabled
-  still errors, which is correct - that state cannot exist.
+  still fails the apply, which is correct - that state cannot exist. (The API
+  accepts the write; it is the capped read disagreeing with the plan that fails.)
 
 ### Changed
 

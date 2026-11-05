@@ -83,7 +83,7 @@ func TestPolicyRuleToModel_EffectiveValues(t *testing.T) {
 	}
 
 	t.Run("inherited severity is not recorded", func(t *testing.T) {
-		m, diags := policyRuleToModel(ctx, inherited, policyID, types.StringNull())
+		m, diags := policyRuleToModel(ctx, inherited, policyID, types.StringNull(), types.BoolNull())
 		if diags.HasError() {
 			t.Fatalf("unexpected diagnostics: %v", diags)
 		}
@@ -93,7 +93,7 @@ func TestPolicyRuleToModel_EffectiveValues(t *testing.T) {
 	})
 
 	t.Run("inherited scope is not recorded", func(t *testing.T) {
-		m, diags := policyRuleToModel(ctx, inherited, policyID, types.StringNull())
+		m, diags := policyRuleToModel(ctx, inherited, policyID, types.StringNull(), types.BoolNull())
 		if diags.HasError() {
 			t.Fatalf("unexpected diagnostics: %v", diags)
 		}
@@ -108,7 +108,7 @@ func TestPolicyRuleToModel_EffectiveValues(t *testing.T) {
 	t.Run("owned severity and scope are recorded", func(t *testing.T) {
 		owned := *inherited
 		owned.ScopeType = "rule_scope"
-		m, diags := policyRuleToModel(ctx, &owned, policyID, types.StringValue("critical"))
+		m, diags := policyRuleToModel(ctx, &owned, policyID, types.StringValue("critical"), types.BoolNull())
 		if diags.HasError() {
 			t.Fatalf("unexpected diagnostics: %v", diags)
 		}
@@ -173,5 +173,73 @@ func TestProviderRegistersEverything(t *testing.T) {
 	}
 	if got, want := len(p.DataSources(ctx)), 7; got != want {
 		t.Errorf("registered data sources: got %d, want %d", got, want)
+	}
+}
+
+// An omitted is_enabled on an UPDATE keeps the planned value: a read-back in an
+// apply that also enabled the parent would otherwise fail Terraform's consistency
+// check.
+func TestPolicyRuleToModel_OmittedIsEnabledKeepsThePlannedValue(t *testing.T) {
+	ctx := context.Background()
+	policyID := types.StringValue("policy_1")
+	// The server now reports the rule as enabled, because its policy just was.
+	pr := &client.PolicyRule{PolicyRuleID: "pr_1", PolicyID: "policy_1", IsEnabled: true}
+
+	m, diags := policyRuleToModel(ctx, pr, policyID, types.StringNull(), types.BoolValue(false))
+	if diags.HasError() {
+		t.Fatalf("unexpected diags: %v", diags)
+	}
+	if m.IsEnabled.ValueBool() != false {
+		t.Errorf("is_enabled: got %v, want the planned false", m.IsEnabled)
+	}
+}
+
+// Null takes the server's value: correct on a create and on a refresh.
+func TestPolicyRuleToModel_NullPlannedTakesTheServerValue(t *testing.T) {
+	ctx := context.Background()
+	pr := &client.PolicyRule{PolicyRuleID: "pr_1", PolicyID: "policy_1", IsEnabled: true}
+
+	m, diags := policyRuleToModel(ctx, pr, types.StringValue("policy_1"),
+		types.StringNull(), types.BoolNull())
+	if diags.HasError() {
+		t.Fatalf("unexpected diags: %v", diags)
+	}
+	if m.IsEnabled.ValueBool() != true {
+		t.Errorf("is_enabled: got %v, want the server's true", m.IsEnabled)
+	}
+}
+
+// The two ModifyPlan predicates must be exact opposites on the config axis and must
+// agree on everything else: between them they decide whether a rule gets an apply it
+// would otherwise never get.
+//
+// The live behaviour is covered by the two DisabledParent acceptance tests - unit
+// tests cannot build the privatestate.ProviderData these are read from, it being
+// internal to the framework.
+func TestIsEnabledModifyPlanPredicates(t *testing.T) {
+	for _, tc := range []struct {
+		name                                string
+		hasState, hasPlan, configSet, owned bool
+		wantRemoved, wantNeverAsserted      bool
+	}{
+		{"removed from a rule that owns it", true, true, false, true, true, false},
+		{"config sets a value we never wrote", true, true, true, false, false, true},
+		{"config sets a value we already own", true, true, true, true, false, false},
+		{"omitted and never owned: a plain inheriting rule", true, true, false, false, false, false},
+		{"no prior state: a create", false, true, false, true, false, false},
+		{"no plan: a destroy", true, false, false, true, false, false},
+		// No private data means an older provider wrote this rule. A removal is left
+		// alone, but a configured value is re-asserted once, closing the upgrade gap.
+		{"pre-upgrade rule, is_enabled omitted", true, true, false, false, false, false},
+		{"pre-upgrade rule, is_enabled configured", true, true, true, false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isEnabledWasRemoved(tc.hasState, tc.hasPlan, tc.configSet, tc.owned); got != tc.wantRemoved {
+				t.Errorf("isEnabledWasRemoved: got %v, want %v", got, tc.wantRemoved)
+			}
+			if got := isEnabledWasNeverAsserted(tc.hasState, tc.hasPlan, tc.configSet, tc.owned); got != tc.wantNeverAsserted {
+				t.Errorf("isEnabledWasNeverAsserted: got %v, want %v", got, tc.wantNeverAsserted)
+			}
+		})
 	}
 }

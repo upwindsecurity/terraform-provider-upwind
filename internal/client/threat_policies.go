@@ -118,6 +118,15 @@ func (c *Client) GetThreatPolicy(ctx context.Context, id string) (*ThreatPolicy,
 	return decodeThreatPolicy(body)
 }
 
+// GetThreatPolicyAfterWrite reads a policy just written, retried briefly on 404.
+// Keep separate from GetThreatPolicy, which Read calls: its 404 is what
+// drops an out-of-band deleted policy from state.
+func (c *Client) GetThreatPolicyAfterWrite(ctx context.Context, id string) (*ThreatPolicy, error) {
+	return retryWhileNotFound(ctx, "read threat policy after write", func(ctx context.Context) (*ThreatPolicy, error) {
+		return c.GetThreatPolicy(ctx, id)
+	})
+}
+
 // CreateThreatPolicy creates one policy via the bulk endpoint and returns it with
 // server-populated fields.
 func (c *Client) CreateThreatPolicy(ctx context.Context, req CreateThreatPolicyRequest) (*ThreatPolicy, error) {
