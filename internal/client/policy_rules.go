@@ -81,13 +81,30 @@ func (c *Client) GetPolicyRule(ctx context.Context, policyID, ruleID string) (*P
 }
 
 // CreatePolicyRule attaches one rule definition to a policy via the bulk endpoint.
+//
+// Retried briefly on 404 after a write, so a policy and its rules can be created in
+// the same apply.
 func (c *Client) CreatePolicyRule(ctx context.Context, policyID string, req CreatePolicyRuleRequest) (*PolicyRule, error) {
-	body, err := c.doRequest(ctx, http.MethodPost, policyRulesPath(policyID)+"/bulk",
-		bulkCreatePolicyRulesRequest{PolicyRules: []CreatePolicyRuleRequest{req}})
-	if err != nil {
-		return nil, err
-	}
-	return decodePolicyRule(body)
+	return retryWhileNotFound(ctx, "create policy rule", func(ctx context.Context) (*PolicyRule, error) {
+		body, err := c.doRequest(ctx, http.MethodPost, policyRulesPath(policyID)+"/bulk",
+			bulkCreatePolicyRulesRequest{PolicyRules: []CreatePolicyRuleRequest{req}})
+		if err != nil {
+			return nil, err
+		}
+		return decodePolicyRule(body)
+	})
+}
+
+// GetPolicyRuleAfterWrite reads a rule just written, retried briefly on 404 like the
+// attach above. Unguarded, a 404 here makes Create error without setting state,
+// leaving a rule the next apply duplicates.
+//
+// Keep separate from GetPolicyRule, which Read calls: its 404 drops a deleted rule
+// out of state.
+func (c *Client) GetPolicyRuleAfterWrite(ctx context.Context, policyID, ruleID string) (*PolicyRule, error) {
+	return retryWhileNotFound(ctx, "read policy rule after write", func(ctx context.Context) (*PolicyRule, error) {
+		return c.GetPolicyRule(ctx, policyID, ruleID)
+	})
 }
 
 // UpdatePolicyRule applies a partial update to one policy rule.

@@ -247,6 +247,24 @@ func (r *ThreatPolicyResource) Create(ctx context.Context, req resource.CreateRe
 		return
 	}
 
+	// DRIFT DEFENSE: wait until the policy is READABLE, so a rule attaching in the
+	// same apply does not 404 on its parent.
+	//
+	// Must stay best-effort: the policy already exists, and erroring here would leave
+	// it in the tenant with nothing in state, which the next apply would duplicate.
+	if readBack, err := r.client.GetThreatPolicyAfterWrite(ctx, policy.PolicyID); err != nil {
+		resp.Diagnostics.AddWarning(
+			"Created the threat policy but could not read it back",
+			fmt.Sprintf("The policy was created as %q and is recorded in state, but reading it "+
+				"back failed, so some server-populated fields may be empty until the next "+
+				"refresh. A resource that depends on this policy may fail to find it on this "+
+				"first apply; re-running usually resolves it.\n\nError: %s",
+				policy.PolicyID, err),
+		)
+	} else {
+		policy = readBack
+	}
+
 	state, diags := threatPolicyToModel(ctx, policy)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -320,6 +338,24 @@ func (r *ThreatPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 	if err != nil {
 		resp.Diagnostics.AddError("Error updating threat policy", err.Error())
 		return
+	}
+
+	// The bulk write response omits creator_id and last_modifier_id, so writing it
+	// straight to state blanks them. Best-effort, as in Create.
+	//
+	// Only the audit fields are taken. Unlike Create, every configured attribute is
+	// KNOWN in an update plan, so adopting the whole read-back would fail the apply
+	// with "inconsistent result" if any of it differed from the plan.
+	if readBack, err := r.client.GetThreatPolicyAfterWrite(ctx, policy.PolicyID); err != nil {
+		resp.Diagnostics.AddWarning(
+			"Updated the threat policy but could not read it back",
+			fmt.Sprintf("The update to %q succeeded and is recorded in state, but some "+
+				"server-populated fields may be empty until the next refresh.\n\nError: %s",
+				policy.PolicyID, err),
+		)
+	} else {
+		policy.CreatorID, policy.LastModifierID = readBack.CreatorID, readBack.LastModifierID
+		policy.CreateTime, policy.UpdateTime = readBack.CreateTime, readBack.UpdateTime
 	}
 
 	newState, diags := threatPolicyToModel(ctx, policy)

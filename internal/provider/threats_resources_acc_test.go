@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -195,6 +196,10 @@ func TestAccPolicyRuleResource(t *testing.T) {
 // policy. Staging a policy disabled, attaching rules, then enabling it is a normal
 // workflow for a security control, which is why this is not an edge case.
 func TestAccPolicyRuleResource_DisabledParent(t *testing.T) {
+	// Captured in step 4, compared in step 5: removing is_enabled must reset the rule
+	// IN PLACE, so the id has to survive.
+	var idBeforeIsEnabledRemoval string
+
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
@@ -215,14 +220,192 @@ func TestAccPolicyRuleResource_DisabledParent(t *testing.T) {
 					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "false"),
 				),
 			},
-			// Step 2: enable the policy. The rule's effective state follows it, and
-			// the config still says nothing about is_enabled - so this also proves
-			// the inherited value is not recorded as an owned one that drifts.
+			// Step 2: enable the policy. Only the POLICY can be asserted here.
+			//
+			// The rule's is_enabled is an effective value the platform recomputes when
+			// its parent changes, but the rule's own configuration did not change, so
+			// Terraform never calls ApplyResourceChange on it and never re-reads it.
+			// The only refresh in this step ran BEFORE the apply, while the policy was
+			// still disabled, so the rule's state correctly still says false. Asserting
+			// true here is asserting something no read has happened to observe.
 			{
 				Config: testAccPolicyRuleDisabledParentConfig(true),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("upwind_threat_policy.parent", "is_enabled", "true"),
+				),
+			},
+			// Step 3: refresh, then assert the rule followed its parent. This is the
+			// first moment a read of the rule happens after the policy was enabled.
+			{
+				RefreshState: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "true"),
+					resource.TestCheckResourceAttr("upwind_threat_policy.parent", "is_enabled", "true"),
+				),
+			},
+			// Step 4: disable the rule explicitly while its policy stays enabled. The
+			// rule now OWNS the value rather than inheriting it.
+			{
+				Config: testAccPolicyRuleDisabledParentConfigWithRule(true, "false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "false"),
+					func(s *terraform.State) error {
+						idBeforeIsEnabledRemoval = s.RootModule().
+							Resources["upwind_threat_policy_rule.test"].Primary.ID
+						return nil
+					},
+				),
+			},
+			// Step 5: remove the line again. The rule must go back to the API default
+			// WITHOUT being recreated.
+			//
+			// Both halves matter. is_enabled reading true proves the reset reached the
+			// server: this step's refresh runs before the plan and reads the owned
+			// false, so a provider that planned an empty diff would leave false in
+			// state. The id proves the reset happened in place - a replacement would
+			// also produce true, by destroying the rule and attaching a new one, which
+			// takes the detection offline for the duration of the apply.
+			{
+				Config: testAccPolicyRuleDisabledParentConfig(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "true"),
+					func(s *terraform.State) error {
+						got := s.RootModule().Resources["upwind_threat_policy_rule.test"].Primary.ID
+						if got != idBeforeIsEnabledRemoval {
+							return fmt.Errorf("rule id changed from %s to %s; removing is_enabled "+
+								"recreated the rule instead of resetting it in place",
+								idBeforeIsEnabledRemoval, got)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccPolicyRuleResource_UnrelatedUpdateLeavesAnUnconfiguredIsEnabledAlone guards
+// the other side of the reset: a config that never mentioned is_enabled is not a
+// removal, and an unrelated edit must not touch the attribute.
+//
+// A rule can legitimately own false while the config says nothing - every rule written
+// by v0.1.1 does, and so does one an operator disabled in the console. Sending the API
+// default whenever the config omits the field would turn those back on during an
+// unrelated severity edit, with nothing in the plan to say so.
+//
+// The assertion has to read the SERVER. State is pinned to the planned value here (the
+// attribute is Optional+Computed and the config is null, so the plan carries prior
+// state), which means a provider that wrongly enabled the rule would still record
+// is_enabled = false and pass any state-based check. That is the shape of test that
+// cannot fail.
+func TestAccPolicyRuleResource_UnrelatedUpdateLeavesAnUnconfiguredIsEnabledAlone(t *testing.T) {
+	var policyID, ruleID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: testAccCheckDestroyed(t, "upwind_threat_policy_rule",
+			func(c *client.Client, rs *terraform.ResourceState) error {
+				_, err := c.GetPolicyRule(context.Background(), rs.Primary.Attributes["policy_id"], rs.Primary.ID)
+				return err
+			}),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPolicyRuleConfig("", ""),
+				Check: func(s *terraform.State) error {
+					rs := s.RootModule().Resources["upwind_threat_policy_rule.test"]
+					policyID, ruleID = rs.Primary.Attributes["policy_id"], rs.Primary.ID
+					return nil
+				},
+			},
+			{
+				// Out of band, as the console would: disable the rule behind Terraform's
+				// back, then make an edit that has nothing to do with is_enabled.
+				PreConfig: func() {
+					disabled := false
+					_, err := testAccClient(t).UpdatePolicyRule(context.Background(), policyID,
+						client.UpdatePolicyRuleRequest{ID: ruleID, IsEnabled: &disabled})
+					if err != nil {
+						t.Fatalf("disabling the rule out of band: %v", err)
+					}
+				},
+				Config: testAccPolicyRuleConfig("high", ""),
+				Check: func(s *terraform.State) error {
+					pr, err := testAccClient(t).GetPolicyRule(context.Background(), policyID, ruleID)
+					if err != nil {
+						return err
+					}
+					if pr.IsEnabled {
+						return fmt.Errorf("rule %s is enabled on the server after an unrelated "+
+							"severity edit: an omitted is_enabled was sent as a reset, turning a "+
+							"disabled detection back on with nothing in the plan to say so", ruleID)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// TestAccPolicyRuleResource_ExplicitValueMatchingTheEffectiveOneIsStillSent covers a
+// value the config states that the API would otherwise never hear.
+//
+// is_enabled is Optional+Computed and the API reports it as an effective value capped
+// by the policy's, so under a DISABLED policy a rule reads false whatever it holds
+// server-side. Writing is_enabled = false then matches state exactly: Terraform plans
+// nothing, no PATCH is sent, and the rule keeps the API default of true. Enabling the
+// policy later turns on a detection the practitioner had declared off.
+//
+// The fix cannot work through is_enabled itself - Terraform rejects a planned value
+// that differs from a known config value - so ModifyPlan marks the write-derived
+// attributes unknown instead. Any non-empty plan reaches Update, and Update sends the
+// configured value.
+func TestAccPolicyRuleResource_ExplicitValueMatchingTheEffectiveOneIsStillSent(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: testAccCheckDestroyed(t, "upwind_threat_policy_rule",
+			func(c *client.Client, rs *terraform.ResourceState) error {
+				_, err := c.GetPolicyRule(context.Background(), rs.Primary.Attributes["policy_id"], rs.Primary.ID)
+				return err
+			}),
+		Steps: []resource.TestStep{
+			// Step 1: disabled policy, rule omits is_enabled. The server stores the API
+			// default (true) and the capped read reports false.
+			{
+				Config: testAccPolicyRuleDisabledParentConfig(false),
+				Check: resource.TestCheckResourceAttr(
+					"upwind_threat_policy_rule.test", "is_enabled", "false"),
+			},
+			// Step 2: add is_enabled = false. The attribute itself cannot carry a diff
+			// here - config and state both read false - so ExpectNonEmptyPlan is what
+			// proves ModifyPlan forced the apply that sends the value.
+			{
+				Config: testAccPolicyRuleDisabledParentConfigWithRule(false, "false"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectNonEmptyPlan()},
+				},
+				Check: resource.TestCheckResourceAttr(
+					"upwind_threat_policy_rule.test", "is_enabled", "false"),
+			},
+			// Step 3: enable the policy. The rule now owns false server-side, so it
+			// stays off and nothing drifts. An empty post-apply plan - the harness
+			// default - is the assertion; before the fix this step produced
+			// "~ is_enabled = true -> false".
+			{
+				Config: testAccPolicyRuleDisabledParentConfigWithRule(true, "false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("upwind_threat_policy.parent", "is_enabled", "true"),
+					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "false"),
+				),
+			},
+			// Step 4: and it survives a refresh, which is where the old behaviour
+			// surfaced the rule as live.
+			{
+				RefreshState: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("upwind_threat_policy.parent", "is_enabled", "true"),
+					resource.TestCheckResourceAttr("upwind_threat_policy_rule.test", "is_enabled", "false"),
 				),
 			},
 		},
@@ -234,6 +417,22 @@ func TestAccPolicyRuleResource_DisabledParent(t *testing.T) {
 // the rule block: the point is what the provider does with a value it must let the
 // server decide.
 func testAccPolicyRuleDisabledParentConfig(policyEnabled bool) string {
+	return testAccPolicyRuleDisabledParentConfigWithRule(policyEnabled, "")
+}
+
+// ruleIsEnabled "" omits the attribute, which is what inheritance requires.
+func testAccPolicyRuleDisabledParentConfigWithRule(policyEnabled bool, ruleIsEnabled string) string {
+	ruleLine := ""
+	if ruleIsEnabled != "" {
+		ruleLine = "  is_enabled = " + ruleIsEnabled
+	}
+	return strings.Replace(
+		testAccPolicyRuleDisabledParentConfigBase(policyEnabled),
+		"resource \"upwind_threat_policy_rule\" \"test\" {",
+		"resource \"upwind_threat_policy_rule\" \"test\" {\n"+ruleLine, 1)
+}
+
+func testAccPolicyRuleDisabledParentConfigBase(policyEnabled bool) string {
 	return fmt.Sprintf(`
 provider "upwind" {}
 
